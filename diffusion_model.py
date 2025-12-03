@@ -99,8 +99,12 @@ class ResidualBlock(nn.Module):
         h = self.bn1(h)
         h = self.relu(h)
         
-        # Add time embedding
-        t_emb = self.time_emb(t).unsqueeze(-1).unsqueeze(-1)
+        # Add time embedding - expand to match spatial dimensions
+        t_emb = self.time_emb(t)
+        # t_emb shape is [batch, out_channels] after time_emb
+        # Need to expand to [batch, out_channels, height, width]
+        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1)  # [batch, out_channels, 1, 1]
+        t_emb = t_emb.expand(-1, -1, h.shape[-2], h.shape[-1])  # [batch, out_channels, height, width]
         h = h + t_emb
         
         # Second conv + batch norm
@@ -164,9 +168,9 @@ class DiffusionUNet(nn.Module):
         self.time_channels = time_channels
         self.base_channels = base_channels
         
-        # Time embedding
+        # Time embedding - input is scalar, so we start with a single value
         self.time_embed = nn.Sequential(
-            nn.Linear(base_channels, time_channels),
+            nn.Linear(1, time_channels),
             nn.ReLU(),
             nn.Linear(time_channels, time_channels)
         )
@@ -196,7 +200,12 @@ class DiffusionUNet(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
     
     def forward(self, x, t):
-        # Time embedding
+        # Time embedding - reshape t to [batch_size, 1] before embedding
+        if t.dim() == 0 or t.shape == torch.Size([]):  # scalar
+            t = t.view(1, 1)
+        elif t.dim() == 1:  # [batch_size]
+            t = t.view(-1, 1)  # [batch_size, 1]
+        
         t_emb = self.time_embed(t)
         
         # Encoder
@@ -209,8 +218,10 @@ class DiffusionUNet(nn.Module):
         e3 = self.enc3(h, t_emb)  # [B, 128, H/4, W/4]
         h = self.downsample(e3)   # [B, 128, H/8, W/8]
         
-        # Middle
-        h = self.middle(h)        # [B, 256, H/8, W/8]
+        # Middle - apply residual blocks with time embedding and attention
+        h = self.middle[0](h, t_emb)  # First residual block with time embedding
+        h = self.middle[1](h)         # Attention block (no time embedding needed)
+        h = self.middle[2](h, t_emb)  # Second residual block with time embedding
         
         # Decoder
         h = self.upsample(h)      # [B, 256, H/4, W/4]
@@ -287,7 +298,9 @@ class DiffusionTrainer:
         x_t, noise = self.forward_diffusion(real_images, t)
         
         # Predict noise
-        noise_pred = self.model(x_t, t.float() / len(self.noise_schedule['betas']))
+        # Normalize t to [0, 1] range for the model
+        t_normalized = t.float() / len(self.noise_schedule['betas'])
+        noise_pred = self.model(x_t, t_normalized)
         
         # Calculate loss
         loss = nn.functional.mse_loss(noise_pred, noise)
@@ -321,7 +334,9 @@ class DiffusionTrainer:
             sqrt_recip_alphas_t = self.noise_schedule['sqrt_recip_alphas'][t].view(-1, 1, 1, 1)
             
             # Predict noise using model
-            model_mean = sqrt_recip_alphas_t * (x - betas_t * self.model(x, t.float() / len(self.noise_schedule['betas'])) / sqrt_one_minus_alphas_cumprod_t)
+            # Normalize t to [0, 1] range for the model
+            t_normalized = t.float() / len(self.noise_schedule['betas'])
+            model_mean = sqrt_recip_alphas_t * (x - betas_t * self.model(x, t_normalized) / sqrt_one_minus_alphas_cumprod_t)
             
             if t == 0:
                 return model_mean
